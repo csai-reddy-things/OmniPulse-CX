@@ -1,5 +1,5 @@
 import express from 'express';
-import pool from '../db/pool.js';
+import supabase from '../db/supabaseClient.js';
 import { authenticateToken } from '../middleware/auth.js';
 import { generateProactiveRetentionMessage } from '../services/geminiService.js';
 
@@ -11,14 +11,14 @@ const router = express.Router();
  */
 router.get('/', authenticateToken, async (req, res) => {
   try {
-    const ordersRes = await pool.query(
-      `SELECT * FROM orders 
-       WHERE user_id = $1 
-       ORDER BY created_at DESC`,
-      [req.user.id]
-    );
+    const { data: orders, error } = await supabase
+      .from('orders')
+      .select('*')
+      .eq('user_id', req.user.id)
+      .order('created_at', { ascending: false });
 
-    res.json(ordersRes.rows);
+    if (error) throw error;
+    res.json(orders || []);
   } catch (error) {
     console.error('Fetch orders error:', error);
     res.status(500).json({ error: 'Failed to retrieve orders.' });
@@ -31,150 +31,152 @@ router.get('/', authenticateToken, async (req, res) => {
  */
 router.post('/:id/simulate-delay', authenticateToken, async (req, res) => {
   const { id } = req.params;
-  const client = await pool.connect();
 
   try {
-    await client.query('BEGIN');
-
     // 1. Fetch order
-    const orderRes = await client.query(
-      'SELECT * FROM orders WHERE id = $1 AND (user_id = $2 OR $3 = $4)',
-      [id, req.user.id, req.user.role, 'admin']
-    );
+    const { data: order, error: orderErr } = await supabase
+      .from('orders')
+      .select('*')
+      .eq('id', id)
+      .maybeSingle();
 
-    if (orderRes.rows.length === 0) {
-      await client.query('ROLLBACK');
-      return res.status(404).json({ error: 'Order not found or unauthorized.' });
+    if (orderErr || !order) {
+      return res.status(404).json({ error: 'Order not found.' });
     }
 
-    const order = orderRes.rows[0];
+    if (req.user.role !== 'admin' && order.user_id !== req.user.id) {
+      return res.status(403).json({ error: 'Unauthorized to modify this order.' });
+    }
+
     const customerId = order.user_id;
     const delayReason = 'Interstate freight line blockage and severe hub transit congestion';
 
     // 2. Mark order delayed in DB
-    const updatedOrderRes = await client.query(
-      `UPDATE orders 
-       SET status = 'delayed', delay_reason = $1, updated_at = NOW() 
-       WHERE id = $2 
-       RETURNING *`,
-      [delayReason, id]
-    );
-    const updatedOrder = updatedOrderRes.rows[0];
+    const { data: updatedOrder, error: updateErr } = await supabase
+      .from('orders')
+      .update({
+        status: 'delayed',
+        delay_reason: delayReason,
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', id)
+      .select()
+      .single();
+
+    if (updateErr) throw updateErr;
 
     // 3. Fetch customer profile
-    const profileRes = await client.query(
-      `SELECT p.*, u.full_name, u.email 
-       FROM customer_profiles p 
-       JOIN users u ON u.id = p.user_id 
-       WHERE p.user_id = $1`,
-      [customerId]
-    );
-    const profile = profileRes.rows[0] || {
-      full_name: 'Customer',
-      loyalty_tier: 'Standard',
-      preferred_channel: 'whatsapp',
-      goodwill_credits: 0
+    const { data: profile } = await supabase
+      .from('customer_profiles')
+      .select('*, users(full_name, email)')
+      .eq('user_id', customerId)
+      .maybeSingle();
+
+    const customerProfile = {
+      full_name: profile?.users?.full_name || 'Valued Customer',
+      loyalty_tier: profile?.loyalty_tier || 'Standard',
+      preferred_channel: profile?.preferred_channel || 'whatsapp',
+      goodwill_credits: parseFloat(profile?.goodwill_credits || 0)
     };
 
     // 4. Generate AI Proactive Retention Outreach via Gemini
     const proactiveResult = await generateProactiveRetentionMessage({
-      customerProfile: profile,
+      customerProfile,
       order: updatedOrder,
       delayReason
     });
 
     // 5. Apply goodwill wallet credit
     if (proactiveResult.offered_credit > 0) {
-      await client.query(
-        `UPDATE customer_profiles 
-         SET goodwill_credits = goodwill_credits + $1, updated_at = NOW() 
-         WHERE user_id = $2`,
-        [proactiveResult.offered_credit, customerId]
-      );
+      await supabase
+        .from('customer_profiles')
+        .update({
+          goodwill_credits: customerProfile.goodwill_credits + proactiveResult.offered_credit,
+          updated_at: new Date().toISOString()
+        })
+        .eq('user_id', customerId);
     }
 
     // 6. Find or create unified conversation
-    let convRes = await client.query(
-      `SELECT id FROM conversations 
-       WHERE user_id = $1 
-       ORDER BY last_message_at DESC 
-       LIMIT 1`,
-      [customerId]
-    );
+    const { data: existingConvs } = await supabase
+      .from('conversations')
+      .select('id')
+      .eq('user_id', customerId)
+      .order('last_message_at', { ascending: false })
+      .limit(1);
 
     let convId;
-    if (convRes.rows.length === 0) {
-      const newConv = await client.query(
-        `INSERT INTO conversations (user_id, status, active_channel, last_message_at) 
-         VALUES ($1, 'open', $2, NOW()) 
-         RETURNING id`,
-        [customerId, profile.preferred_channel || 'whatsapp']
-      );
-      convId = newConv.rows[0].id;
+    if (!existingConvs || existingConvs.length === 0) {
+      const { data: newConv } = await supabase
+        .from('conversations')
+        .insert({
+          user_id: customerId,
+          status: 'open',
+          active_channel: customerProfile.preferred_channel,
+          last_message_at: new Date().toISOString()
+        })
+        .select('id')
+        .single();
+      convId = newConv.id;
     } else {
-      convId = convRes.rows[0].id;
-      await client.query(
-        `UPDATE conversations 
-         SET last_message_at = NOW(), active_channel = $1 
-         WHERE id = $2`,
-        [profile.preferred_channel || 'whatsapp', convId]
-      );
+      convId = existingConvs[0].id;
+      await supabase
+        .from('conversations')
+        .update({
+          last_message_at: new Date().toISOString(),
+          active_channel: customerProfile.preferred_channel
+        })
+        .eq('id', convId);
     }
 
     // 7. Insert proactive message into thread
-    const msgRes = await client.query(
-      `INSERT INTO messages 
-       (conversation_id, sender_type, channel, email_subject, content, metadata, created_at)
-       VALUES ($1, 'system_proactive', $2, $3, $4, $5, NOW())
-       RETURNING *`,
-      [
-        convId,
-        profile.preferred_channel || 'whatsapp',
-        `Important Update: Delivery Status for #${updatedOrder.order_number}`,
-        proactiveResult.proactive_message,
-        JSON.stringify({
+    const { data: savedMessage, error: msgErr } = await supabase
+      .from('messages')
+      .insert({
+        conversation_id: convId,
+        sender_type: 'system_proactive',
+        channel: customerProfile.preferred_channel,
+        email_subject: `Important Update: Delivery Status for #${updatedOrder.order_number}`,
+        content: proactiveResult.proactive_message,
+        metadata: {
           type: 'proactive_retention_delay',
           order_number: updatedOrder.order_number,
           offered_credit: proactiveResult.offered_credit,
           summary_badge: proactiveResult.summary_badge
-        })
-      ]
-    );
-    const savedMessage = msgRes.rows[0];
+        }
+      })
+      .select()
+      .single();
+
+    if (msgErr) throw msgErr;
 
     // 8. Log support action
     const actionSummary = `Proactive carrier delay outreach triggered for ${updatedOrder.order_number}. Credited ₹${proactiveResult.offered_credit} goodwill retention incentive.`;
-    const actionRes = await client.query(
-      `INSERT INTO support_actions 
-       (conversation_id, order_id, action_type, action_summary, action_payload)
-       VALUES ($1, $2, 'apply_goodwill_credit', $3, $4)
-       RETURNING *`,
-      [
-        convId,
-        id,
-        actionSummary,
-        JSON.stringify({
+    const { data: actionRecord } = await supabase
+      .from('support_actions')
+      .insert({
+        conversation_id: convId,
+        order_id: id,
+        action_type: 'apply_goodwill_credit',
+        action_summary: actionSummary,
+        action_payload: {
           order_number: updatedOrder.order_number,
           credit_amount: proactiveResult.offered_credit,
           badge: proactiveResult.summary_badge
-        })
-      ]
-    );
-
-    await client.query('COMMIT');
+        }
+      })
+      .select()
+      .single();
 
     res.json({
       success: true,
       order: updatedOrder,
       proactive_message: savedMessage,
-      action: actionRes.rows[0]
+      action: actionRecord
     });
   } catch (error) {
-    await client.query('ROLLBACK');
     console.error('Simulate delay error:', error);
     res.status(500).json({ error: 'Failed to simulate carrier delay.' });
-  } finally {
-    client.release();
   }
 });
 

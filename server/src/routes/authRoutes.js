@@ -1,10 +1,9 @@
 import express from 'express';
 import bcrypt from 'bcryptjs';
-import pool from '../db/pool.js';
+import supabase from '../db/supabaseClient.js';
 import { generateToken, authenticateToken } from '../middleware/auth.js';
 import { validateBody } from '../middleware/validate.js';
 import { registerSchema, loginSchema, demoLoginSchema } from '../validators/schemas.js';
-import { seedDatabase } from '../db/seed.js';
 
 const router = express.Router();
 
@@ -13,34 +12,45 @@ const router = express.Router();
  */
 router.post('/register', validateBody(registerSchema), async (req, res) => {
   const { full_name, email, password, preferred_channel, phone_number, city } = req.body;
-  const client = await pool.connect();
 
   try {
-    const existing = await client.query('SELECT id FROM users WHERE email = $1', [email]);
-    if (existing.rows.length > 0) {
+    const { data: existing } = await supabase
+      .from('users')
+      .select('id')
+      .eq('email', email)
+      .maybeSingle();
+
+    if (existing) {
       return res.status(409).json({ error: 'An account with this email address already exists.' });
     }
 
-    await client.query('BEGIN');
-
     const passwordHash = await bcrypt.hash(password, 10);
-    const userResult = await client.query(
-      `INSERT INTO users (full_name, email, password_hash, role)
-       VALUES ($1, $2, $3, 'customer')
-       RETURNING id, full_name, email, role, created_at`,
-      [full_name, email, passwordHash]
-    );
-    const user = userResult.rows[0];
+    const { data: user, error: userErr } = await supabase
+      .from('users')
+      .insert({
+        full_name,
+        email,
+        password_hash: passwordHash,
+        role: 'customer'
+      })
+      .select('id, full_name, email, role, created_at')
+      .single();
 
-    const profileResult = await client.query(
-      `INSERT INTO customer_profiles (user_id, loyalty_tier, lifetime_spend, goodwill_credits, preferred_channel, phone_number, city)
-       VALUES ($1, 'Standard', 0.00, 0.00, $2, $3, $4)
-       RETURNING *`,
-      [user.id, preferred_channel || 'whatsapp', phone_number || null, city || null]
-    );
-    const profile = profileResult.rows[0];
+    if (userErr) throw userErr;
 
-    await client.query('COMMIT');
+    const { data: profile } = await supabase
+      .from('customer_profiles')
+      .insert({
+        user_id: user.id,
+        loyalty_tier: 'Standard',
+        lifetime_spend: 0.00,
+        goodwill_credits: 0.00,
+        preferred_channel: preferred_channel || 'whatsapp',
+        phone_number: phone_number || null,
+        city: city || null
+      })
+      .select('*')
+      .single();
 
     const token = generateToken(user);
     res.status(201).json({
@@ -49,11 +59,8 @@ router.post('/register', validateBody(registerSchema), async (req, res) => {
       profile
     });
   } catch (error) {
-    await client.query('ROLLBACK');
     console.error('Registration error:', error);
     res.status(500).json({ error: 'Registration failed due to server error.' });
-  } finally {
-    client.release();
   }
 });
 
@@ -64,16 +71,16 @@ router.post('/login', validateBody(loginSchema), async (req, res) => {
   const { email, password } = req.body;
 
   try {
-    const userRes = await pool.query(
-      'SELECT id, full_name, email, password_hash, role, created_at FROM users WHERE email = $1',
-      [email]
-    );
+    const { data: user, error: userErr } = await supabase
+      .from('users')
+      .select('id, full_name, email, password_hash, role, created_at')
+      .eq('email', email)
+      .maybeSingle();
 
-    if (userRes.rows.length === 0) {
+    if (userErr || !user) {
       return res.status(401).json({ error: 'Invalid email or password.' });
     }
 
-    const user = userRes.rows[0];
     const isMatch = await bcrypt.compare(password, user.password_hash);
     if (!isMatch) {
       return res.status(401).json({ error: 'Invalid email or password.' });
@@ -81,8 +88,12 @@ router.post('/login', validateBody(loginSchema), async (req, res) => {
 
     let profile = null;
     if (user.role === 'customer') {
-      const profRes = await pool.query('SELECT * FROM customer_profiles WHERE user_id = $1', [user.id]);
-      profile = profRes.rows[0] || null;
+      const { data: prof } = await supabase
+        .from('customer_profiles')
+        .select('*')
+        .eq('user_id', user.id)
+        .maybeSingle();
+      profile = prof || null;
     }
 
     const safeUser = {
@@ -114,30 +125,26 @@ router.post('/demo', validateBody(demoLoginSchema), async (req, res) => {
   const targetEmail = role === 'admin' ? 'admin@omnipulse.ai' : 'aarav@demo.com';
 
   try {
-    let userRes = await pool.query(
-      'SELECT id, full_name, email, role, created_at FROM users WHERE email = $1',
-      [targetEmail]
-    );
+    const { data: user, error: userErr } = await supabase
+      .from('users')
+      .select('id, full_name, email, role, created_at')
+      .eq('email', targetEmail)
+      .maybeSingle();
 
-    // If database wasn't seeded yet, seed it automatically
-    if (userRes.rows.length === 0) {
-      await seedDatabase(false);
-      userRes = await pool.query(
-        'SELECT id, full_name, email, role, created_at FROM users WHERE email = $1',
-        [targetEmail]
-      );
+    if (userErr || !user) {
+      return res.status(404).json({ 
+        error: `Demo account for ${role} (${targetEmail}) not found. Please ensure database seed SQL was executed.` 
+      });
     }
 
-    if (userRes.rows.length === 0) {
-      return res.status(404).json({ error: `Demo account for ${role} not found. Please run seed script.` });
-    }
-
-    const user = userRes.rows[0];
     let profile = null;
-
     if (user.role === 'customer') {
-      const profRes = await pool.query('SELECT * FROM customer_profiles WHERE user_id = $1', [user.id]);
-      profile = profRes.rows[0] || null;
+      const { data: prof } = await supabase
+        .from('customer_profiles')
+        .select('*')
+        .eq('user_id', user.id)
+        .maybeSingle();
+      profile = prof || null;
     }
 
     const token = generateToken(user);
@@ -157,21 +164,24 @@ router.post('/demo', validateBody(demoLoginSchema), async (req, res) => {
  */
 router.get('/me', authenticateToken, async (req, res) => {
   try {
-    const userRes = await pool.query(
-      'SELECT id, full_name, email, role, created_at FROM users WHERE id = $1',
-      [req.user.id]
-    );
+    const { data: user, error: userErr } = await supabase
+      .from('users')
+      .select('id, full_name, email, role, created_at')
+      .eq('id', req.user.id)
+      .maybeSingle();
 
-    if (userRes.rows.length === 0) {
+    if (userErr || !user) {
       return res.status(404).json({ error: 'User account not found.' });
     }
 
-    const user = userRes.rows[0];
     let profile = null;
-
     if (user.role === 'customer') {
-      const profRes = await pool.query('SELECT * FROM customer_profiles WHERE user_id = $1', [user.id]);
-      profile = profRes.rows[0] || null;
+      const { data: prof } = await supabase
+        .from('customer_profiles')
+        .select('*')
+        .eq('user_id', user.id)
+        .maybeSingle();
+      profile = prof || null;
     }
 
     res.json({

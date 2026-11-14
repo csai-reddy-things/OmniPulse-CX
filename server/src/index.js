@@ -3,6 +3,7 @@ import cors from 'cors';
 import helmet from 'helmet';
 import dotenv from 'dotenv';
 import pool from './db/pool.js';
+import supabase from './db/supabaseClient.js';
 import { runMigrations } from './db/migrate.js';
 import { seedDatabase } from './db/seed.js';
 
@@ -11,6 +12,12 @@ import orderRoutes from './routes/orderRoutes.js';
 import conversationRoutes from './routes/conversationRoutes.js';
 import adminRoutes from './routes/adminRoutes.js';
 
+import path from 'path';
+import { fileURLToPath } from 'url';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+dotenv.config({ path: path.resolve(__dirname, '../.env') });
 dotenv.config();
 
 const app = express();
@@ -38,12 +45,10 @@ app.use(express.urlencoded({ extended: true }));
 
 // 2. Health Check Endpoint (Render Monitoring)
 app.get('/api/health', async (req, res) => {
-  let dbStatus = 'disconnected';
+  let dbStatus = 'connected';
   try {
-    const dbTest = await pool.query('SELECT 1 as alive');
-    if (dbTest.rows.length > 0) {
-      dbStatus = 'connected';
-    }
+    const { error } = await supabase.from('users').select('id').limit(1);
+    if (error) dbStatus = `supabase_error: ${error.message}`;
   } catch (err) {
     dbStatus = `error: ${err.message}`;
   }
@@ -80,18 +85,17 @@ app.use((err, req, res, next) => {
 async function startServer() {
   console.log('🚀 [STARTUP]: Starting OmniPulse CX Express Server...');
   
-  if (process.env.DATABASE_URL) {
+  if (process.env.DATABASE_URL && !process.env.DATABASE_URL.includes('[YOUR-PASSWORD]')) {
     try {
       console.log('📦 [DATABASE]: Applying database schema migrations...');
       await runMigrations();
       console.log('🌱 [DATABASE]: Ensuring demo accounts and baseline data exist...');
       await seedDatabase(false);
     } catch (dbInitErr) {
-      console.warn('⚠️ [STARTUP NOTICE]: Database connection or migration skipped/failed on startup:', dbInitErr.message);
-      console.warn('   Ensure Supabase DATABASE_URL is valid in server/.env when ready.');
+      console.warn('⚠️ [STARTUP NOTICE]: Direct pg connection skipped on startup:', dbInitErr.message);
     }
   } else {
-    console.warn('⚠️ [STARTUP WARNING]: DATABASE_URL is not set. Configure server/.env with your Supabase connection string.');
+    console.log('⚡ [SUPABASE]: Connected directly to Supabase Cloud API with Service Role.');
   }
 
   app.listen(PORT, '0.0.0.0', () => {

@@ -1,8 +1,8 @@
-import pool from '../db/pool.js';
+import supabase from '../db/supabaseClient.js';
 
 /**
  * Autonomous Support Action Execution Engine
- * Executes deterministic, auditable database mutations triggered by AI intent.
+ * Executes deterministic, auditable database mutations triggered by AI intent via Supabase.
  */
 export async function executeSupportAction({
   actionType,
@@ -15,10 +15,7 @@ export async function executeSupportAction({
     return null;
   }
 
-  const client = await pool.connect();
   try {
-    await client.query('BEGIN');
-
     let actionSummary = '';
     let actionPayload = {};
     let targetOrderId = null;
@@ -28,18 +25,21 @@ export async function executeSupportAction({
     let targetOrder = null;
 
     if (orderNumber) {
-      const orderRes = await client.query(
-        'SELECT * FROM orders WHERE user_id = $1 AND (order_number ILIKE $2 OR order_number ILIKE $3) LIMIT 1',
-        [userId, orderNumber.trim(), `%${orderNumber.trim().replace('#', '')}%`]
-      );
-      if (orderRes.rows.length > 0) {
-        targetOrder = orderRes.rows[0];
+      const cleanNum = orderNumber.trim().replace('#', '');
+      const { data: matchedOrders } = await supabase
+        .from('orders')
+        .select('*')
+        .eq('user_id', userId)
+        .ilike('order_number', `%${cleanNum}%`)
+        .limit(1);
+      
+      if (matchedOrders && matchedOrders.length > 0) {
+        targetOrder = matchedOrders[0];
         targetOrderId = targetOrder.id;
       }
     }
 
     if (!targetOrder && customerOrders.length > 0) {
-      // Pick the most recent non-delivered order, or the latest order
       targetOrder = customerOrders.find(o => ['delayed', 'out_for_delivery', 'processing', 'shipped'].includes(o.status)) || customerOrders[0];
       targetOrderId = targetOrder.id;
       orderNumber = targetOrder.order_number;
@@ -74,12 +74,10 @@ export async function executeSupportAction({
         const refundAmount = targetOrder.total_amount;
         const refundReason = actionParams.reason || 'Customer satisfaction resolution for logistics delay/issue';
 
-        await client.query(
-          `UPDATE orders 
-           SET status = 'refunded', updated_at = NOW() 
-           WHERE id = $1`,
-          [targetOrderId]
-        );
+        await supabase
+          .from('orders')
+          .update({ status: 'refunded', updated_at: new Date().toISOString() })
+          .eq('id', targetOrderId);
 
         actionSummary = `Instant full refund of ₹${refundAmount} processed for order ${targetOrder.order_number}.`;
         actionPayload = {
@@ -102,12 +100,14 @@ export async function executeSupportAction({
         const newDate = actionParams.new_delivery_date || new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString().split('T')[0];
         const newSlot = actionParams.new_delivery_slot || '10:00 AM - 2:00 PM';
 
-        await client.query(
-          `UPDATE orders 
-           SET estimated_delivery = $1, delivery_slot = $2, updated_at = NOW() 
-           WHERE id = $3`,
-          [newDate, newSlot, targetOrderId]
-        );
+        await supabase
+          .from('orders')
+          .update({
+            estimated_delivery: newDate,
+            delivery_slot: newSlot,
+            updated_at: new Date().toISOString()
+          })
+          .eq('id', targetOrderId);
 
         actionSummary = `Delivery for order ${targetOrder.order_number} successfully rescheduled to ${newDate} (${newSlot}).`;
         actionPayload = {
@@ -128,24 +128,24 @@ export async function executeSupportAction({
         const replacementNumber = `${targetOrder.order_number}-REP`;
         const estDelivery = new Date(Date.now() + 2 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
 
-        // Insert replacement order with 0 amount
-        const repRes = await client.query(
-          `INSERT INTO orders 
-           (order_number, user_id, product_name, quantity, total_amount, status, carrier_name, tracking_hub, estimated_delivery, delivery_slot)
-           VALUES ($1, $2, $3, $4, 0.00, 'replacement_dispatched', 'BlueDart Priority Air', 'Express Fulfillment Hub', $5, '10:00 AM - 2:00 PM')
-           ON CONFLICT (order_number) DO UPDATE
-           SET status = 'replacement_dispatched'
-           RETURNING id, order_number`,
-          [
-            replacementNumber,
-            userId,
-            `${targetOrder.product_name} (Complimentary Replacement)`,
-            targetOrder.quantity,
-            estDelivery
-          ]
-        );
+        const { data: repOrder } = await supabase
+          .from('orders')
+          .upsert({
+            order_number: replacementNumber,
+            user_id: userId,
+            product_name: `${targetOrder.product_name} (Complimentary Replacement)`,
+            quantity: targetOrder.quantity || 1,
+            total_amount: 0.00,
+            status: 'replacement_dispatched',
+            carrier_name: 'BlueDart Priority Air',
+            tracking_hub: 'Express Fulfillment Hub',
+            estimated_delivery: estDelivery,
+            delivery_slot: '10:00 AM - 2:00 PM'
+          }, { onConflict: 'order_number' })
+          .select('id, order_number')
+          .single();
 
-        targetOrderId = repRes.rows[0].id;
+        targetOrderId = repOrder ? repOrder.id : targetOrderId;
         actionSummary = `Complimentary replacement order ${replacementNumber} dispatched at ₹0.00 cost.`;
         actionPayload = {
           original_order_number: targetOrder.order_number,
@@ -160,15 +160,23 @@ export async function executeSupportAction({
       case 'apply_goodwill_credit': {
         const creditAmount = actionParams.credit_amount || 250.00;
 
-        const profileRes = await client.query(
-          `UPDATE customer_profiles 
-           SET goodwill_credits = goodwill_credits + $1, updated_at = NOW() 
-           WHERE user_id = $2
-           RETURNING goodwill_credits`,
-          [creditAmount, userId]
-        );
+        const { data: currentProf } = await supabase
+          .from('customer_profiles')
+          .select('goodwill_credits')
+          .eq('user_id', userId)
+          .single();
 
-        const newBalance = profileRes.rows[0]?.goodwill_credits || creditAmount;
+        const currentCreds = parseFloat(currentProf?.goodwill_credits || 0);
+        const newBalance = currentCreds + creditAmount;
+
+        await supabase
+          .from('customer_profiles')
+          .update({
+            goodwill_credits: newBalance,
+            updated_at: new Date().toISOString()
+          })
+          .eq('user_id', userId);
+
         actionSummary = `Applied ₹${creditAmount} retention goodwill credit to customer wallet. New balance: ₹${newBalance}.`;
         actionPayload = {
           credit_amount: creditAmount,
@@ -181,12 +189,14 @@ export async function executeSupportAction({
       case 'escalate_to_human': {
         const escalationReason = actionParams.reason || 'AI Escalate: Customer requested senior human specialist';
 
-        await client.query(
-          `UPDATE conversations 
-           SET status = 'escalated', escalation_reason = $1, last_message_at = NOW() 
-           WHERE id = $2`,
-          [escalationReason, conversationId]
-        );
+        await supabase
+          .from('conversations')
+          .update({
+            status: 'escalated',
+            escalation_reason: escalationReason,
+            last_message_at: new Date().toISOString()
+          })
+          .eq('id', conversationId);
 
         actionSummary = `Conversation escalated to Executive CX Specialist. Reason: "${escalationReason}".`;
         actionPayload = {
@@ -204,23 +214,24 @@ export async function executeSupportAction({
     // Insert into support_actions audit table
     let actionRecord = null;
     if (actionSummary) {
-      const inserted = await client.query(
-        `INSERT INTO support_actions 
-         (conversation_id, order_id, action_type, action_summary, action_payload)
-         VALUES ($1, $2, $3, $4, $5)
-         RETURNING *`,
-        [conversationId, targetOrderId, actionType, actionSummary, JSON.stringify(actionPayload)]
-      );
-      actionRecord = inserted.rows[0];
+      const { data: insertedAction } = await supabase
+        .from('support_actions')
+        .insert({
+          conversation_id: conversationId,
+          order_id: targetOrderId,
+          action_type: actionType,
+          action_summary: actionSummary,
+          action_payload: actionPayload
+        })
+        .select()
+        .single();
+
+      actionRecord = insertedAction;
     }
 
-    await client.query('COMMIT');
     return actionRecord;
   } catch (error) {
-    await client.query('ROLLBACK');
     console.error(`❌ [ACTION EXECUTOR ERROR] (${actionType}):`, error.message);
     throw error;
-  } finally {
-    client.release();
   }
 }
