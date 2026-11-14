@@ -35,6 +35,24 @@ CORE OPERATING PRINCIPLES:
 5. AUTONOMOUS ACTION EXECUTION: When a customer asks to track an order, get a refund for a damaged/delayed/wrong item, reschedule delivery, or get a replacement, select the appropriate tool action and populate exact parameters from their order context.
 6. HUMAN ESCALATION GUARDRAIL: If the customer expresses extreme anger, threatens legal action/chargebacks, reports repeated unresolved failures, or requests a human manager, set selected_action to 'escalate_to_human' and requires_human_escalation to true.`;
 
+async function callWithTimeout(promise, timeoutMs = 4000) {
+  let timeoutId;
+  const timeoutPromise = new Promise((_, reject) => {
+    timeoutId = setTimeout(() => {
+      reject(new Error(`Gemini API call timed out after ${timeoutMs}ms. Fallback active.`));
+    }, timeoutMs);
+  });
+
+  try {
+    const res = await Promise.race([promise, timeoutPromise]);
+    clearTimeout(timeoutId);
+    return res;
+  } catch (err) {
+    clearTimeout(timeoutId);
+    throw err;
+  }
+}
+
 /**
  * Prompt A: Omnichannel Conversational & Autonomous Action Engine
  */
@@ -83,15 +101,18 @@ Respond with ONLY valid JSON adhering strictly to:
 
   if (ai) {
     try {
-      const response = await ai.models.generateContent({
-        model: MODEL_NAME,
-        contents: promptContext,
-        config: {
-          systemInstruction: SYSTEM_INSTRUCTION,
-          responseMimeType: 'application/json',
-          temperature: 0.2
-        }
-      });
+      const response = await callWithTimeout(
+        ai.models.generateContent({
+          model: MODEL_NAME,
+          contents: promptContext,
+          config: {
+            systemInstruction: SYSTEM_INSTRUCTION,
+            responseMimeType: 'application/json',
+            temperature: 0.2
+          }
+        }),
+        4500
+      );
 
       const parsed = JSON.parse(response.text.trim());
       const validated = aiActionResponseSchema.parse(parsed);
@@ -146,15 +167,18 @@ Respond with ONLY valid JSON adhering strictly to:
 
   if (ai) {
     try {
-      const response = await ai.models.generateContent({
-        model: MODEL_NAME,
-        contents: promptContext,
-        config: {
-          systemInstruction: 'You are an Executive Customer Retention & Operational Intelligence Analyst.',
-          responseMimeType: 'application/json',
-          temperature: 0.1
-        }
-      });
+      const response = await callWithTimeout(
+        ai.models.generateContent({
+          model: MODEL_NAME,
+          contents: promptContext,
+          config: {
+            systemInstruction: 'You are an Executive Customer Retention & Operational Intelligence Analyst.',
+            responseMimeType: 'application/json',
+            temperature: 0.1
+          }
+        }),
+        4500
+      );
 
       const parsed = JSON.parse(response.text.trim());
       const validated = aiInsightResponseSchema.parse(parsed);
@@ -203,15 +227,18 @@ Respond with ONLY valid JSON:
 
   if (ai) {
     try {
-      const response = await ai.models.generateContent({
-        model: MODEL_NAME,
-        contents: promptContext,
-        config: {
-          systemInstruction: 'You are an elite Proactive Retention and Logistics Empathy Specialist for OmniPulse CX.',
-          responseMimeType: 'application/json',
-          temperature: 0.3
-        }
-      });
+      const response = await callWithTimeout(
+        ai.models.generateContent({
+          model: MODEL_NAME,
+          contents: promptContext,
+          config: {
+            systemInstruction: 'You are an elite Proactive Retention and Logistics Empathy Specialist for OmniPulse CX.',
+            responseMimeType: 'application/json',
+            temperature: 0.3
+          }
+        }),
+        4500
+      );
 
       const parsed = JSON.parse(response.text.trim());
       const validated = proactiveRetentionSchema.parse(parsed);
