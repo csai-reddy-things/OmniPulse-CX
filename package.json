@@ -1,0 +1,25 @@
+{
+  "name": "omnipulse-cx-root",
+  "version": "1.0.0",
+  "private": true,
+  "description": "OmniPulse CX — AI-Powered Omnichannel Customer Experience & Proactive Retention Platform",
+  "scripts": {
+    "install:all": "npm.cmd --prefix server install && npm.cmd --prefix client install",
+    "dev:server": "npm.cmd --prefix server run dev",
+    "dev:client": "npm.cmd --prefix client run dev",
+    "build:client": "npm.cmd --prefix client run build",
+    "db:migrate": "npm.cmd --prefix server run db:migrate",
+    "db:seed": "npm.cmd --prefix server run db:seed"
+  },
+  "keywords": [
+    "ai",
+    "cx",
+    "omnichannel",
+    "gemini",
+    "supabase",
+    "react",
+    "express"
+  ],
+  "author": "OmniPulse CX Team",
+  "license": "MIT"
+}
