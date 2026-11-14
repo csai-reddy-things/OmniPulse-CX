@@ -41,7 +41,11 @@ export const RegisterPage = () => {
       await register(formData);
       navigate('/cx-hub');
     } catch (err) {
-      setError(err.response?.data?.error || err.response?.data?.details?.[0]?.message || 'Registration failed.');
+      setError(
+        err.response?.data?.error || 
+        err.response?.data?.details?.[0]?.message || 
+        (!err.response ? 'Cannot connect to backend server. Please verify backend status or network connection.' : 'Registration failed.')
+      );
     } finally {
       setLoading(false);
     }

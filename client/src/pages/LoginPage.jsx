@@ -1,6 +1,7 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
+import { getApiBaseUrl } from '../api/axiosClient';
 import { 
   Zap, 
   User, 
@@ -9,7 +10,11 @@ import {
   Lock, 
   Mail, 
   ArrowRight,
-  AlertCircle 
+  AlertCircle,
+  Settings,
+  CheckCircle2,
+  RefreshCw,
+  Globe
 } from 'lucide-react';
 
 export const LoginPage = () => {
@@ -17,9 +22,81 @@ export const LoginPage = () => {
   const [password, setPassword] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+  
+  // Endpoint diagnostic / configuration state
+  const [apiUrl, setApiUrl] = useState(getApiBaseUrl());
+  const [showConfig, setShowConfig] = useState(false);
+  const [customUrlInput, setCustomUrlInput] = useState('');
+  const [testingHealth, setTestingHealth] = useState(false);
+  const [healthStatus, setHealthStatus] = useState(null);
 
   const { login, demoLogin } = useAuth();
   const navigate = useNavigate();
+
+  useEffect(() => {
+    const current = getApiBaseUrl();
+    setApiUrl(current);
+    setCustomUrlInput(localStorage.getItem('omnipulse_custom_api_url') || current);
+  }, []);
+
+  const handleTestHealth = async (urlToTest) => {
+    const target = (urlToTest || customUrlInput || apiUrl).trim().replace(/\/+$/, '');
+    setTestingHealth(true);
+    setHealthStatus(null);
+    try {
+      const res = await fetch(`${target}/health`);
+      const data = await res.json();
+      if (res.ok && data.status === 'ok') {
+        setHealthStatus({ ok: true, message: `Connected! Service: ${data.service}` });
+      } else {
+        setHealthStatus({ ok: false, message: `HTTP ${res.status}: Backend reached but returned error.` });
+      }
+    } catch (err) {
+      setHealthStatus({ 
+        ok: false, 
+        message: `Cannot reach backend at ${target}. (If Render Free Tier, it may take ~40s to wake up).` 
+      });
+    } finally {
+      setTestingHealth(false);
+    }
+  };
+
+  const handleSaveCustomUrl = (e) => {
+    e.preventDefault();
+    if (!customUrlInput.trim()) {
+      localStorage.removeItem('omnipulse_custom_api_url');
+    } else {
+      localStorage.setItem('omnipulse_custom_api_url', customUrlInput.trim().replace(/\/+$/, ''));
+    }
+    const updated = getApiBaseUrl();
+    setApiUrl(updated);
+    handleTestHealth(updated);
+  };
+
+  const handleResetUrl = () => {
+    localStorage.removeItem('omnipulse_custom_api_url');
+    const reset = getApiBaseUrl();
+    setApiUrl(reset);
+    setCustomUrlInput(reset);
+    setHealthStatus(null);
+  };
+
+  const formatErrorMessage = (err, fallbackText) => {
+    if (!err.response) {
+      return (
+        <div className="space-y-1">
+          <div className="font-semibold text-rose-300">
+            Cannot connect to backend server ({apiUrl})
+          </div>
+          <div className="text-[11px] text-rose-400/90 leading-relaxed">
+            • If running on Render Free Tier, the backend service sleeps after 15m and takes ~40s to wake up. Please wait 30 seconds and retry.<br />
+            • If on mobile/another device, tap <strong>"Configure Backend Endpoint"</strong> below to connect to your live Render backend URL or local network IP.
+          </div>
+        </div>
+      );
+    }
+    return err.response?.data?.error || fallbackText;
+  };
 
   const handleStandardLogin = async (e) => {
     e.preventDefault();
@@ -34,7 +111,7 @@ export const LoginPage = () => {
         navigate('/cx-hub');
       }
     } catch (err) {
-      setError(err.response?.data?.error || 'Invalid credentials. Please verify your email and password.');
+      setError(formatErrorMessage(err, 'Invalid credentials. Please verify your email and password.'));
     } finally {
       setLoading(false);
     }
@@ -52,7 +129,7 @@ export const LoginPage = () => {
         navigate('/cx-hub');
       }
     } catch (err) {
-      setError(err.response?.data?.error || 'Demo login failed. Please ensure the server database is seeded.');
+      setError(formatErrorMessage(err, 'Demo login failed. Please ensure the server database is seeded.'));
     } finally {
       setLoading(false);
     }
@@ -205,6 +282,95 @@ export const LoginPage = () => {
                 Register Customer
               </Link>
             </span>
+          </div>
+
+          {/* Quick Backend Connectivity & Endpoint Configuration */}
+          <div className="pt-4 border-t border-slate-800/80">
+            <div className="flex items-center justify-between">
+              <button
+                type="button"
+                onClick={() => setShowConfig(!showConfig)}
+                className="inline-flex items-center gap-1.5 text-[11px] text-slate-400 hover:text-indigo-300 transition-colors"
+              >
+                <Settings className="w-3.5 h-3.5" />
+                <span>Backend API Connection</span>
+                <span className="text-[10px] px-1.5 py-0.5 rounded bg-slate-800 text-slate-400 font-mono truncate max-w-[140px]">
+                  {apiUrl.replace(/^https?:\/\//, '')}
+                </span>
+              </button>
+              <button
+                type="button"
+                disabled={testingHealth}
+                onClick={() => handleTestHealth(apiUrl)}
+                className="text-[11px] text-indigo-400 hover:text-indigo-300 flex items-center gap-1 disabled:opacity-50"
+              >
+                <RefreshCw className={`w-3 h-3 ${testingHealth ? 'animate-spin' : ''}`} />
+                <span>Ping API</span>
+              </button>
+            </div>
+
+            {showConfig && (
+              <div className="mt-3 p-3 rounded-xl bg-slate-950/80 border border-slate-800 space-y-2.5 text-left">
+                <div className="flex items-center justify-between">
+                  <span className="text-[11px] font-semibold text-slate-300 flex items-center gap-1">
+                    <Globe className="w-3.5 h-3.5 text-indigo-400" />
+                    Configure Backend Endpoint
+                  </span>
+                  <button
+                    type="button"
+                    onClick={handleResetUrl}
+                    className="text-[10px] text-slate-400 hover:text-rose-400"
+                  >
+                    Reset to default
+                  </button>
+                </div>
+                
+                <p className="text-[10px] text-slate-400 leading-normal">
+                  If opening on another device or mobile, paste your deployed Render URL (e.g. <code className="text-indigo-300">https://your-service.onrender.com/api</code>) or local Wi-Fi IP (<code className="text-indigo-300">http://192.168.x.x:5000/api</code>).
+                </p>
+
+                <form onSubmit={handleSaveCustomUrl} className="space-y-2">
+                  <input
+                    type="text"
+                    value={customUrlInput}
+                    onChange={(e) => setCustomUrlInput(e.target.value)}
+                    placeholder="https://your-service.onrender.com/api"
+                    className="w-full rounded-lg bg-slate-900 border border-slate-700 px-3 py-1.5 text-xs text-white placeholder-slate-500 font-mono focus:outline-none focus:border-indigo-500"
+                  />
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="submit"
+                      className="px-3 py-1 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-[11px] font-bold text-white transition-colors"
+                    >
+                      Save & Test
+                    </button>
+                    <button
+                      type="button"
+                      disabled={testingHealth}
+                      onClick={() => handleTestHealth(customUrlInput)}
+                      className="px-3 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-[11px] text-slate-300 transition-colors disabled:opacity-50"
+                    >
+                      Test Connection
+                    </button>
+                  </div>
+                </form>
+
+                {healthStatus && (
+                  <div className={`p-2 rounded-lg text-[11px] flex items-start gap-1.5 ${
+                    healthStatus.ok 
+                      ? 'bg-emerald-500/10 border border-emerald-500/20 text-emerald-300' 
+                      : 'bg-rose-500/10 border border-rose-500/20 text-rose-300'
+                  }`}>
+                    {healthStatus.ok ? (
+                      <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400 shrink-0 mt-0.5" />
+                    ) : (
+                      <AlertCircle className="w-3.5 h-3.5 text-rose-400 shrink-0 mt-0.5" />
+                    )}
+                    <span className="leading-snug">{healthStatus.message}</span>
+                  </div>
+                )}
+              </div>
+            )}
           </div>
         </div>
       </div>
